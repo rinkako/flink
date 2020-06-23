@@ -324,11 +324,9 @@ public class SlotPoolImpl implements SlotPool {
 		checkNotNull(resourceManagerGateway);
 		checkNotNull(pendingRequest);
 
-		log.info("Requesting new slot [{}] and profile {} from resource manager.", pendingRequest.getSlotRequestId(), pendingRequest.getResourceProfile());
-
 		final AllocationID allocationId = new AllocationID();
-
 		pendingRequest.setAllocationId(allocationId);
+
 		pendingRequests.put(pendingRequest.getSlotRequestId(), allocationId, pendingRequest);
 
 		pendingRequest.getAllocatedSlotFuture().whenComplete(
@@ -344,6 +342,9 @@ public class SlotPoolImpl implements SlotPool {
 					}
 				}
 			});
+
+		log.info("Requesting new slot [{}] and profile {} with allocation id {} from resource manager.",
+			pendingRequest.getSlotRequestId(), pendingRequest.getResourceProfile(), allocationId);
 
 		CompletableFuture<Acknowledge> rmResponse = resourceManagerGateway.requestSlot(
 			jobMasterId,
@@ -553,15 +554,19 @@ public class SlotPoolImpl implements SlotPool {
 			log.debug("Fulfilling pending slot request [{}] with slot [{}]",
 				pendingRequest.getSlotRequestId(), allocatedSlot.getAllocationId());
 
-			// this allocation may become orphan once its corresponding request is removed
-			final AllocationID allocationIdOfRequest = pendingRequests.getKeyBByKeyA(pendingRequest.getSlotRequestId());
-
 			removePendingRequest(pendingRequest.getSlotRequestId());
 
 			allocatedSlots.add(pendingRequest.getSlotRequestId(), allocatedSlot);
 			pendingRequest.getAllocatedSlotFuture().complete(allocatedSlot);
 
-			maybeRemapOrphanedAllocation(allocationIdOfRequest, allocatedSlot.getAllocationId());
+			// this allocation may become orphan once its corresponding request is removed
+			final Optional<AllocationID> allocationIdOfRequest = pendingRequest.getAllocationId();
+
+			// the allocation id can be null if the request was fulfilled by a slot directly offered
+			// by a reconnected TaskExecutor before the ResourceManager is connected
+			if (allocationIdOfRequest.isPresent()) {
+				maybeRemapOrphanedAllocation(allocationIdOfRequest.get(), allocatedSlot.getAllocationId());
+			}
 		} else {
 			log.debug("Adding slot [{}] to available slots", allocatedSlot.getAllocationId());
 			availableSlots.add(allocatedSlot, clock.relativeTimeMillis());
@@ -597,18 +602,22 @@ public class SlotPoolImpl implements SlotPool {
 		// if the request of that allocated slot is still pending, it should take over the orphaned allocation.
 		// this enables the request to fail fast if the remapped allocation fails.
 		if (!allocationIdOfRequest.equals(allocationIdOfSlot)) {
-			final SlotRequestId requestIdOfAllocatedSlot = pendingRequests.getKeyAByKeyB(allocationIdOfSlot);
-			if (requestIdOfAllocatedSlot != null) {
-				final PendingRequest requestOfAllocatedSlot = pendingRequests.getValueByKeyA(requestIdOfAllocatedSlot);
+			final PendingRequest requestOfAllocatedSlot = pendingRequests.getValueByKeyB(allocationIdOfSlot);
+			if (requestOfAllocatedSlot != null) {
 				requestOfAllocatedSlot.setAllocationId(allocationIdOfRequest);
 
-				// this re-insertion of initiatedRequestId will not affect its original insertion order
-				pendingRequests.put(requestIdOfAllocatedSlot, allocationIdOfRequest, requestOfAllocatedSlot);
+				// this re-insertion of request will not affect its original insertion order
+				pendingRequests.put(
+					requestOfAllocatedSlot.getSlotRequestId(),
+					allocationIdOfRequest,
+					requestOfAllocatedSlot);
 			} else {
 				// request id of the allocated slot can be null if the slot is returned by scheduler.
 				// the orphaned allocation will not be adopted in this case, which means it is not needed
 				// anymore by any pending requests. we should cancel it to avoid allocating unnecessary slots.
-				resourceManagerGateway.cancelSlotRequest(allocationIdOfRequest);
+				if (resourceManagerGateway != null) {
+					resourceManagerGateway.cancelSlotRequest(allocationIdOfRequest);
+				}
 			}
 		}
 	}
@@ -1084,12 +1093,9 @@ public class SlotPoolImpl implements SlotPool {
 		 * @param allocationID The allocation id
 		 * @return The allocated slot, null if we can't find a match
 		 */
+		@Nullable
 		AllocatedSlot get(final AllocationID allocationID) {
 			return allocatedSlotsById.getValueByKeyA(allocationID);
-		}
-
-		AllocatedSlot get(final SlotRequestId slotRequestId) {
-			return allocatedSlotsById.getValueByKeyB(slotRequestId);
 		}
 
 		/**
